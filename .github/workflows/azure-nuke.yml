@@ -1,0 +1,75 @@
+# This is a workflow of nuking access from azure
+
+name: Azure nuke
+run-name: Azure nuke sandbox for ${{ github.event.client_payload.resourceGroup }}
+
+on: 
+  repository_dispatch:
+    types: nuke-azure-sandbox-access
+
+permissions:
+      id-token: write
+      contents: read
+
+
+
+jobs:
+
+  nuking_Azure_Access:
+
+    # The type of runner that the job will run on
+
+    runs-on: "runner_name"                            # Replace with your runner name
+    env:
+      AUTOMATION_NAME: "automation_account_name"      # Replace with Automation Account Name 
+      GITHUBREPO: "sandbox-provisioner-azure"         # Replace with github repo 
+      AUTOMATION_RG: "automation_account_rg"          # Replace with Automation Account Resource Group
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+
+    steps:
+    
+     - name: Install Azure Cli
+       run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+     - name: 'Az CLI login'
+       uses: azure/login@v1
+       with:
+          client-id: ${{ secrets.AZ_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZ_TENANT_ID }}
+          subscription-id: ${{ secrets.AZ_SUBSCRIPTION_ID }}
+          
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+     
+     - name: "We are deleting these resources"
+       run: |
+         echo "resource group name: ${{ github.event.client_payload.resourceGroup}} "
+         echo "scheduler name: ${{ github.event.client_payload.scheduler}} "
+         echo "runbook name: ${{ github.event.client_payload.runbook}} "
+    
+     - name: "Delete the resource group of the user"
+       run: az group delete --name ${{ github.event.client_payload.resourceGroup}} --subscription ${{ github.event.client_payload.subscription_id}} --yes
+
+      
+     - name: "Delete the runbook which is created for the user"
+       run: |
+          az config set extension.use_dynamic_install=yes_without_prompt
+          az automation runbook delete --automation-account-name ${{env.AUTOMATION_NAME}}  --resource-group  ${{env.AUTOMATION_RG}}    --name ${{ github.event.client_payload.runbook}}   --yes
+       
+     - name: "Delete the scheduler which we created for the runbook"
+       run: |
+          az automation schedule delete --name ${{ github.event.client_payload.scheduler}} --resource-group ${{env.AUTOMATION_RG}}      --automation-account-name  ${{env.AUTOMATION_NAME}} --yes
+    
+    
+     #- name: "Delete Guest User"
+     #  run: az ad user delete --id ${{ github.event.client_payload.assignee }} 
+          
+    
+     - name: 'Alert on Slack about resource deletion status'
+       uses: act10ns/slack@v1
+       with:
+         status: ${{ job.status }}
+         config: .github/config/azure_nuke_slack.yaml
+       if: failure()
+       env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

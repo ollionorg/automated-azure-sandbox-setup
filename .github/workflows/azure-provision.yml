@@ -1,0 +1,333 @@
+name: 'Azure Sandbox Access'
+run-name: Azure Sandbox - ${{ inputs.TEAM }} - ${{ inputs.USER_EMAIL }} for ${{ inputs.PURPOSE }} for ${{ inputs.DURATION }}
+
+on:
+ workflow_dispatch:
+    inputs:
+      USER_EMAIL:
+        description: "Email of User"
+        required: true
+        type: string
+      
+      PERMISSION_SET:
+        description: "Access role for user"
+        type: choice
+        options:
+          - Contributor
+        required: true
+      DURATION:
+        description: "Select the duration of access required in hours "
+        type: choice
+        required: true
+        options:
+          - 2 Hours
+          - 4 Hours
+          - 8 Hours
+          - 16 Hours
+          - 24 Hours
+          - 48 Hours
+          - 96 Hours
+          - 120 Hours
+          - 168 Hours
+
+      TEAM:
+        description: "Select your team"
+        type: choice
+        options:
+          - 
+          - TEAM_1
+          - TEAM_2
+          - TEAM_3
+          - TEAM_4
+          - TEAM_5
+        required: true
+
+      OTHER_USERS:
+        description: Enter emails separated by comma of other users that require access to the sandbox. e.g email1,email2,email3 (Optional)
+      
+      PURPOSE:
+        description: "Purpose of Access"
+        type: string
+        default: "POC on Azure"
+
+permissions:
+      id-token: write
+      contents: read
+env:  
+  CREDENTIALS_FILE: ${{ secrets.CREDENTIALS_FILE }}
+      
+jobs: 
+
+  provisioning_ResourceGroup_Access:
+    runs-on: "runner_name"                        # Replace with your runner name
+    defaults:
+      run:
+        working-directory: azure
+    env:
+      GITHUB_USER_NAME: "github_user"             # Replace with github user
+      GITHUBREPO: "sandbox-provisioner-azure"
+      RAGNAME: "automation_account_rg"            # Replace with Automation Account Resource Group
+      AUTOMATION_NAME: "automation_account_name"  # Replace with Automation Account Name
+      AUTOMATION_RG: "automation_account_rg"      # Replace with Automation Account Resource Group
+      AUTOMATION1: 'github_trigger.ps1'
+      AUTOMATION2: 'scheduler.ps1' 
+      LOCATION: 'southeastasia'                   # Replace with location
+      
+      
+    steps:
+
+    - name: "Checkout Repository"
+      uses: actions/checkout@v1
+      with:
+          fetch-depth: 1       
+    
+    - name: "Configure Docker if not exists"
+      working-directory: azure
+      run: |
+          sudo bash install_prerequisites.sh
+
+    - name: "Install python3.8"
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.8'
+    
+    - name: "Install pwsh and Azure cli"
+      run: |
+         #!/bin/bash
+         cd /tmp
+         wget -q "https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb"
+         sudo dpkg -i packages-microsoft-prod.deb
+         sudo apt-get update
+         sudo apt-get install -y powershell jq
+         curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+     
+    - name: "Install Powershell Module"
+      shell: pwsh
+      run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Microsoft.Graph -Scope CurrentUser
+          Install-Module -Name Az  -Scope CurrentUser
+          
+
+    - name: "To create a user list in a CSV file, run the script"
+      run: |
+        #!/bin/bash
+        INPUT_USER_EMAIL="${{ inputs.USER_EMAIL }}"
+        TEAM_EMAIL_LIST=$(echo ${{ inputs.OTHER_USERS }}  | tr "," " ")
+        USERLIST=$(echo $INPUT_USER_EMAIL $TEAM_EMAIL_LIST)
+        rm -rf userlist.csv
+        for USERS in ${USERLIST[@]};do
+          bash  google-workspace-user.sh $USERS
+        done
+
+    
+    - name: "Invite a guest user after validating whether the user exists in the domain"
+      uses: azure/powershell@v1
+      with:
+        inlineScript: |
+           $ApplicationID = "${{ secrets.AZ_CLIENT_ID }}"
+           $TenantDomainName = "${{ secrets.AZ_TENANT_ID }}"
+           $AccessSecret = "${{ secrets.AZ_MGGRAPH_SECRET_TOKEN }}"
+           $Body = @{
+            Grant_Type    = "client_credentials"
+            Scope         = "https://graph.microsoft.com/.default"
+            client_Id     = $ApplicationID
+            Client_Secret = $AccessSecret
+            }
+           $ConnectGraph = Invoke-RestMethod -Uri https://login.microsoftonline.com/$TenantDomainName/oauth2/v2.0/token -Method POST -Body $Body
+           $token = $ConnectGraph.access_token 
+           $SecureToken = ConvertTo-SecureString -String $token -AsPlainText -Force
+           $SecureToken | ConvertFrom-SecureString | Out-File "azure/access_token.txt"
+
+           $users = Import-Csv -Path "azure/userlist.csv"
+           echo $users
+
+           try {
+              $SecureToken = Get-Content "azure/access_token.txt" | ConvertTo-SecureString
+              Connect-MgGraph -AccessToken $SecureToken
+              foreach ($user in $users) {
+                 $displayName = $user.DISPLAY_NAME
+                 echo $displayName
+                 $emailAddress = $user.USER_EMAIL
+                 echo $emailAddress
+                 $username = Get-MgUser -Filter "mail eq '$emailAddress'"
+                 echo $username
+               if ($username) {
+               Write-Host "User exists: $emailAddress"
+               } 
+               elseif ($displayName -eq $null -or $displayName -eq "") {
+                Write-Host "Display name not provided. Exiting"
+                exit 1
+               } 
+               else {
+                 Write-Host "User does not exist: $emailAddress"
+                 New-MgInvitation -InvitedUserDisplayName "$displayName" -InvitedUserEmailAddress $emailAddress -InviteRedirectUrl "https://account.activedirectory.windowsazure.com/?tenantid=${{ secrets.AZ_TENANT_ID }}&login_hint=$emailAddress" -SendInvitationMessage:$true
+
+                }
+            
+               } 
+             }
+            
+           catch {
+              Write-Host "Error checking user: $emailAddress"
+              Write-Host $_.Exception.Message
+           }
+           Disconnect-MgGraph
+        azPSVersion: "latest"
+        
+    - name: "Az CLI login"
+      uses: azure/login@v1
+      with:
+          client-id: ${{ secrets.AZ_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZ_TENANT_ID }}
+          subscription-id: ${{ secrets.AZ_SUBSCRIPTION_ID	 }}             
+
+    - name: "Generate a random resource group name for the user"
+      run: |
+        echo "Owner_RG_Name=$(echo ${{ inputs.USER_EMAIL  }} | cut -d'@' -f1|tr '.' '-')" >> $GITHUB_ENV
+        echo "RG_NAME=$(echo ${{ inputs.USER_EMAIL  }} | cut -d'@' -f1|tr '.' '-')-$(date +%y%m%d_%H%M%S )" >> $GITHUB_ENV
+
+    - name: "Generate Expiry TimeStamp From The Duration From Inputs"
+      run: |
+        echo "EXPIRES_AT=$(TZ=UTC date --date='${{ inputs.DURATION  }}' +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_ENV
+      
+  
+    - name: "Get the user's assignee ID"
+      run: |
+        #!/bin/bash
+      
+        INPUT_USER_EMAIL="${{ inputs.USER_EMAIL }}"
+        TEAM_EMAIL_LIST=$(echo ${{ inputs.OTHER_USERS }}  | tr "," " ")
+        USERLIST=$(echo $INPUT_USER_EMAIL $TEAM_EMAIL_LIST)
+        rm -rf ASSIGNEE_LIST.txt
+        echo $USERLIST
+        for USERS in ${USERLIST[@]};do
+         while true; do
+          USER_JSON=$(az ad user list --query "[?mail=='$USERS']" -o json)
+          echo $USER_JSON
+          USER_ID=$(echo $USER_JSON | jq '.[0].id' -r )
+          if test $USER_ID == "null" ; then
+            echo "Waiting for User to be created"
+          else
+            echo "$USER_ID" >> ASSIGNEE_LIST.txt
+            break
+          fi
+         done
+         sleep 5
+        done
+
+    - name: "Create a resource group for the user"
+      run: |
+        #!/bin/bash
+        if [ "${{ inputs.TEAM }}" == "TEAM_1" ]; then
+           SUBSCRIPTION_ID=$(az account list | jq -r '.[] | select(.tenantId == "${{ secrets.AZ_TENANT_ID }}") |  select (.name == "subscription_name_1") | .id ')
+        elif [ "${{ inputs.TEAM }}" == "TEAM_2" ]; then
+           SUBSCRIPTION_ID=$(az account list | jq -r '.[] | select(.tenantId == "${{ secrets.AZ_TENANT_ID }}") |  select (.name == "subscription_name_2") | .id ')
+        elif [ "${{ inputs.TEAM }}" == "TEAM_3" ]; then
+           SUBSCRIPTION_ID=$(az account list | jq -r '.[] | select(.tenantId == "${{ secrets.AZ_TENANT_ID }}") |  select (.name == "subscription_name_3") | .id ')
+        elif [ "${{ inputs.TEAM }}"  == "TEAM_4" ]; then
+           SUBSCRIPTION_ID=$(az account list | jq -r '.[] | select(.tenantId == "${{ secrets.AZ_TENANT_ID }}") |  select (.name == "subscription_name_4") | .id ')
+        elif [ "${{ inputs.TEAM }}" == "TEAM_5" ]; then
+           SUBSCRIPTION_ID=$(az account list | jq -r '.[] | select(.tenantId == "${{ secrets.AZ_TENANT_ID }}") |  select (.name == "subscription_name_5") | .id ')
+        else
+            echo "Invalid team name"
+            exit 1
+        fi
+        echo "SUBSCRIPTION_ID=$SUBSCRIPTION_ID" >> $GITHUB_ENV
+         
+        resourceGroupPrefix=$Owner_RG_Name 
+        existingResourceGroups=$(az group list --query "[?starts_with(name, '$resourceGroupPrefix')].name" -o tsv)
+
+        if [ -n "$existingResourceGroups" ]; then
+           echo "Resource group(s) with the prefix $resourceGroupPrefix already exist:"
+           echo "$existingResourceGroups"
+           echo "Exiting the script."
+           exit 1
+        else
+           echo "No resource group with the prefix $resourceGroupPrefix exists. Proceeding with the creation."
+           az group create -l ${{env.LOCATION}}  -n $RG_NAME  --subscription $SUBSCRIPTION_ID  --tags  Owner="${{ inputs.USER_EMAIL  }}"
+           echo "Resource group created successfully."
+        fi
+
+  
+    - name : "Assign the user to the Resource Group created earlier"
+      run: |
+        
+        FILENAME=ASSIGNEE_LIST.txt
+        if [ -s "$FILENAME" ]; then
+           while read ASSIGNEE; do
+             if  [ -z "$ASSIGNEE" ] ;then
+                 echo "No User Id Found"
+                 exit 1
+             else
+              sleep 10
+              az role assignment create --assignee $ASSIGNEE --role ${{ inputs.PERMISSION_SET  }} --resource-group $RG_NAME --subscription $SUBSCRIPTION_ID
+            fi
+             done < "$FILENAME"
+        else
+            echo "File is Empty"
+            exit  1
+        fi
+        echo "ASSIGNEE=`cat ASSIGNEE_LIST.txt  | head -1` " >> $GITHUB_ENV
+        
+        
+    
+    - name: "Create a runbook for automating the process of deleting a user"
+      run: |
+        az config set extension.use_dynamic_install=yes_without_prompt
+        az automation runbook create --automation-account-name ${{env.AUTOMATION_NAME}} --resource-group  ${{env.AUTOMATION_RG}} --name $RG_NAME-RUNBOOK --type "PowerShell" --location  ${{env.LOCATION}}  
+    
+    - name: "Set the script variables' values"
+      run: |
+        sed -i 's/GIT_TOKEN/${{secrets.GIT_TOKEN}}/g' ${{env.AUTOMATION1}}
+        sed -i 's/GITHUB_USER_NAME/${{env.GITHUB_USER_NAME}}/g' ${{env.AUTOMATION1}}
+        sed -i 's/GITHUBREPO/${{env.GITHUBREPO}}/g' ${{env.AUTOMATION1}}
+        #sed -i 's/ASSIGNEE/${{env.ASSIGNEE}}/g' ${{env.AUTOMATION1}}
+        sed -i 's/SUBSCRIPTION_ID/${{env.SUBSCRIPTION_ID}}/g' ${{env.AUTOMATION1}}
+        sed -i 's/RESOURCE_GROUP/${{env.RG_NAME}}/g' ${{env.AUTOMATION1}}
+        sed -i 's/RUNBOOK_NAME/${{env.RG_NAME}}-RUNBOOK/g' ${{env.AUTOMATION1}}
+        sed -i 's/SCHEDULER_NAME/${{env.RG_NAME}}-Schedular/g' ${{env.AUTOMATION1}}
+        #sed -i 's/GITHUBREPO/${GITHUBREPO}/g' ${{env.AUTOMATION1}}
+        #sed -i 's/AUTOMATION_ACCOUNT_NAME/${{env.AUTOMATION_NAME}}/g' ${{env.AUTOMATION1}}
+        sed -i 's/AUTOMATION_ACCOUNT_NAME/${{env.AUTOMATION_NAME}}/g' ${{env.AUTOMATION2}}
+        sed -i 's/SCHEDULER_NAME/${{env.RG_NAME}}-Schedular/g' ${{env.AUTOMATION2}}
+        sed -i 's/RUNBOOK_NAME/${{env.RG_NAME}}-RUNBOOK/g' ${{env.AUTOMATION2}}
+        sed -i 's/SCHEDULE_TIME/${{env.EXPIRES_AT}}/g' ${{env.AUTOMATION2}}
+        sed -i 's/RAGNAME/${{env.RAGNAME}}/g' ${{env.AUTOMATION2}}
+   
+    - name: "Replace and publish the runbook content"
+      run: |
+        az automation runbook replace-content --automation-account-name ${{env.AUTOMATION_NAME}} --resource-group  ${{env.AUTOMATION_RG}}    --name $RG_NAME-RUNBOOK  --content @${{env.AUTOMATION1}}
+        az automation runbook publish --automation-account-name ${{env.AUTOMATION_NAME}}  --name   $RG_NAME-RUNBOOK --resource-group ${{env.AUTOMATION_RG}}
+       
+    - name: "Create a run for the Scheduler and start it"
+      run: |
+        az automation runbook create --automation-account-name ${{env.AUTOMATION_NAME}} --resource-group  ${{env.AUTOMATION_RG}} --name $RG_NAME-RUNBOOK-01 --type "PowerShell" --location  ${{env.LOCATION}}  
+        az automation runbook replace-content --automation-account-name ${{env.AUTOMATION_NAME}} --resource-group  ${{env.AUTOMATION_RG}}    --name $RG_NAME-RUNBOOK-01  --content @${{env.AUTOMATION2}}
+        az automation runbook publish --automation-account-name ${{env.AUTOMATION_NAME}}  --name   $RG_NAME-RUNBOOK-01 --resource-group ${{env.AUTOMATION_RG}}
+        az automation runbook start --automation-account-name ${{env.AUTOMATION_NAME}}  --resource-group     ${{env.AUTOMATION_RG}}            --name $RG_NAME-RUNBOOK-01  
+     
+    - name: "Create delete the automation for the scheduler runbook"
+      run: |
+        sleep 180s
+        date
+        az automation runbook delete --automation-account-name ${{env.AUTOMATION_NAME}}  --resource-group  ${{env.AUTOMATION_RG}}    --name $RG_NAME-RUNBOOK-01  --yes
+    
+    - name: "Revoke access to the resources group for the user"
+      run: |
+        echo "User  ${{inputs.USER_EMAIL}} and ${{ inputs.OTHER_USERS }} acquire access of this resource group ${{env.RG_NAME}}  for a ${{ inputs.DURATION  }} time"
+
+    - name: "Remove the credential file and any additional files"
+      run: |
+        rm -rf credentials.json 
+        rm -rf access_token.txt
+   
+
+    - name: 'Alert on Slack about the status of project creation'
+      uses: act10ns/slack@v1
+      with:
+         status: ${{ job.status }}
+         config: .github/config/azure_provisioning_slack.yaml
+      if: failure()
+      env:
+         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
