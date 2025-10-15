@@ -6,6 +6,7 @@ We'd like to thank all the contributors who have helped to make this project wha
 
 - [Akash Yendhe](https://github.com/yendheakash)
 - [Vishal Kapse](https://github.com/vishal-kapse)
+- [Sachin Sharma](https://github.com/SachinCldCvr)
 
 ## All Contributors
 
@@ -15,6 +16,7 @@ In alphabetical order:
 - [Paresh Sahare](https://github.com/pareshcc)
 - [Varun Chandak](https://github.com/varunchandak)
 - [Vishal Kapse](https://github.com/vishal-kapse)
+- [Sachin Sharma](https://github.com/SachinCldCvr)
 
 
 ## Contributions of any kind welcome!
